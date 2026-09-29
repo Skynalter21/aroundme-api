@@ -1,3 +1,4 @@
+const fs = require("fs");
 const path = require("path");
 const multer = require("multer");
 const express = require("express");
@@ -6,6 +7,11 @@ const http = require("http");
 const { Server } = require("socket.io");
 const { v4: uuid } = require("uuid");
 const prisma = require("./src/prisma");
+const {
+  getS2CellKey,
+  getCoverageCells,
+  calculateDistanceKm,
+} = require("./src/s2Service");
 
 const app = express();
 const server = http.createServer(app);
@@ -17,49 +23,91 @@ const io = new Server(server, {
 });
 
 app.use(cors());
-app.use("/uploads", express.static(path.join(__dirname, "uploads")));
+
+const uploadsDir = path.join(__dirname, "uploads");
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir, { recursive: true });
+}
+
+app.use("/uploads", express.static(uploadsDir));
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
-    cb(null, "uploads/");
+    cb(null, uploadsDir);
   },
   filename: (req, file, cb) => {
-    const fileName = `${Date.now()}-${file.originalname}`;
+    const ext =
+      path.extname(file.originalname) ||
+      (file.mimetype.startsWith("video/") ? ".mp4" : ".jpg");
+    const cleanBase = path
+      .basename(file.originalname, ext)
+      .replace(/[^a-zA-Z0-9_-]/g, "_")
+      .slice(0, 30);
+    const fileName = `${Date.now()}-${uuid().slice(0, 8)}-${cleanBase || "media"}${ext}`;
     cb(null, fileName);
   },
 });
 
-const upload = multer({ storage });
+const upload = multer({
+  storage,
+  limits: {
+    fileSize: 100 * 1024 * 1024, // 100MB
+  },
+});
+
 app.use(express.json());
+
+// Logger de requisições
+app.use((req, res, next) => {
+  console.log(`[${new Date().toLocaleTimeString()}] ${req.method} ${req.url}`);
+  next();
+});
 
 io.on("connection", (socket) => {
   console.log("Usuário conectado:", socket.id);
+
+  // Cliente pode entrar na sala da sua célula S2 para otimização futura
+  socket.on("join_cell", (cellKey) => {
+    if (cellKey) {
+      socket.join(`s2_${cellKey}`);
+    }
+  });
 
   socket.on("disconnect", () => {
     console.log("Usuário desconectado:", socket.id);
   });
 });
 
-function calculateDistanceKm(lat1, lon1, lat2, lon2) {
-  const R = 6371;
-
-  const dLat = ((lat2 - lat1) * Math.PI) / 180;
-  const dLon = ((lon2 - lon1) * Math.PI) / 180;
-
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos((lat1 * Math.PI) / 180) *
-      Math.cos((lat2 * Math.PI) / 180) *
-      Math.sin(dLon / 2) *
-      Math.sin(dLon / 2);
-
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-
-  return R * c;
+// Backfill automático de mensagens antigas sem s2Cell
+async function backfillS2Cells() {
+  try {
+    const unindexed = await prisma.message.findMany({
+      where: { s2Cell: null },
+      take: 500,
+    });
+    for (const msg of unindexed) {
+      if (typeof msg.latitude === "number" && typeof msg.longitude === "number") {
+        const cell = getS2CellKey(msg.latitude, msg.longitude, 13);
+        await prisma.message.update({
+          where: { id: msg.id },
+          data: { s2Cell: cell },
+        });
+      }
+    }
+    if (unindexed.length > 0) {
+      console.log(`[S2 Geometry] Backfill: ${unindexed.length} mensagens indexadas com sucesso.`);
+    }
+  } catch (err) {
+    console.log("Erro no backfill S2:", err?.message);
+  }
 }
+backfillS2Cells();
 
 app.get("/", (req, res) => {
-  res.json({ message: "AroundMe API rodando" });
+  res.json({
+    message: "AroundMe API rodando com Google S2 Geometry",
+    time: new Date(),
+  });
 });
 
 app.post("/users", async (req, res) => {
@@ -74,14 +122,12 @@ app.post("/users", async (req, res) => {
 
     res.status(201).json(user);
   } catch (error) {
-    console.log(error);
-
-    res.status(500).json({
-      error: "Erro ao salvar usuário",
-    });
+    console.error("Erro ao salvar usuário:", error);
+    res.status(500).json({ error: "Erro ao salvar usuário" });
   }
 });
 
+// Busca mensagens no raio otimizada pelo Google S2 Geometry
 app.get("/messages", async (req, res) => {
   try {
     const { latitude, longitude, radius } = req.query;
@@ -90,16 +136,42 @@ app.get("/messages", async (req, res) => {
     const userLng = Number(longitude);
     const userRadius = Number(radius || 5);
 
-    const messages = await prisma.message.findMany({
-      where: {
+    if (isNaN(userLat) || isNaN(userLng)) {
+      return res.status(400).json({ error: "Coordenadas inválidas" });
+    }
+
+    // 1. Fase 1: Cobertura de Células S2 Geometry
+    const { level, cells, centerKey } = getCoverageCells(userLat, userLng, userRadius);
+
+    let whereCondition = { deletedAt: null };
+
+    if (level === 13) {
+      whereCondition = {
         deletedAt: null,
-      },
+        OR: [
+          { s2Cell: { in: cells } },
+          { s2Cell: null }, // Suporte a mensagens antigas
+        ],
+      };
+    } else {
+      whereCondition = {
+        deletedAt: null,
+        OR: [
+          ...cells.map((prefix) => ({ s2Cell: { startsWith: prefix } })),
+          { s2Cell: null },
+        ],
+      };
+    }
+
+    const candidateMessages = await prisma.message.findMany({
+      where: whereCondition,
       orderBy: {
         createdAt: "asc",
       },
     });
 
-    const nearbyMessages = messages
+    // 2. Fase 2: Refinamento de distância exata com Haversine
+    const nearbyMessages = candidateMessages
       .map((message) => {
         const distance = calculateDistanceKm(
           userLat,
@@ -117,35 +189,61 @@ app.get("/messages", async (req, res) => {
 
     res.json(nearbyMessages);
   } catch (error) {
-    console.log(error);
-
-    res.status(500).json({
-      error: "Erro ao buscar mensagens",
-    });
+    console.error("Erro ao buscar mensagens com S2:", error);
+    res.status(500).json({ error: "Erro ao buscar mensagens" });
   }
 });
 
+// Envio de mensagem de texto com S2 e Aprendizado de Bairro
 app.post("/messages", async (req, res) => {
   try {
-    const {
-      userId,
-      nickname,
-      district,
-      text,
-      latitude,
-      longitude,
-    } = req.body;
+    const { userId, nickname, district, text, latitude, longitude } = req.body;
+
+    if (!text || !text.trim()) {
+      return res.status(400).json({ error: "Texto da mensagem é obrigatório" });
+    }
+
+    const lat = Number(latitude);
+    const lng = Number(longitude);
+    const s2Cell = getS2CellKey(lat, lng, 13);
+
+    // Garante que o usuário existe
+    await prisma.user.upsert({
+      where: { id: userId },
+      update: { nickname },
+      create: { id: userId, nickname },
+    });
+
+    // Aprende ou recupera o bairro da célula S2
+    let finalDistrict = district;
+    if (district && district !== "Local próximo") {
+      await prisma.cellDistrict
+        .upsert({
+          where: { s2Cell },
+          update: { district },
+          create: { s2Cell, district },
+        })
+        .catch(() => {});
+    } else {
+      const known = await prisma.cellDistrict.findUnique({
+        where: { s2Cell },
+      });
+      if (known) {
+        finalDistrict = known.district;
+      }
+    }
 
     const message = await prisma.message.create({
       data: {
         id: uuid(),
         userId,
         nickname,
-        district,
+        district: finalDistrict || "Local próximo",
         type: "text",
-        text,
-        latitude,
-        longitude,
+        text: text.trim(),
+        latitude: lat,
+        longitude: lng,
+        s2Cell,
       },
     });
 
@@ -153,11 +251,8 @@ app.post("/messages", async (req, res) => {
 
     res.status(201).json(message);
   } catch (error) {
-    console.log(error);
-
-    res.status(500).json({
-      error: "Erro ao salvar mensagem",
-    });
+    console.error("Erro ao salvar mensagem:", error);
+    res.status(500).json({ error: "Erro ao salvar mensagem" });
   }
 });
 
@@ -189,30 +284,61 @@ app.delete("/messages/:id", async (req, res) => {
 
     res.json({ success: true });
   } catch (error) {
-    console.log(error);
-
-    res.status(500).json({
-      error: "Erro ao apagar mensagem",
-    });
+    console.error("Erro ao apagar mensagem:", error);
+    res.status(500).json({ error: "Erro ao apagar mensagem" });
   }
 });
 
+// Envio de mídia com S2 e Aprendizado de Bairro
 app.post("/messages/media", upload.single("media"), async (req, res) => {
   try {
-    const { userId, nickname, district, latitude, longitude, type } = req.body;
+    const { userId, nickname, district, latitude, longitude, type, text } = req.body;
 
-    const mediaUrl = `http://10.0.2.2:3333/uploads/${req.file.filename}`;
+    if (!req.file) {
+      return res.status(400).json({ error: "Nenhum arquivo enviado" });
+    }
+
+    const lat = Number(latitude);
+    const lng = Number(longitude);
+    const s2Cell = getS2CellKey(lat, lng, 13);
+    const mediaUrl = `/uploads/${req.file.filename}`;
+
+    await prisma.user.upsert({
+      where: { id: userId },
+      update: { nickname },
+      create: { id: userId, nickname },
+    });
+
+    let finalDistrict = district;
+    if (district && district !== "Local próximo") {
+      await prisma.cellDistrict
+        .upsert({
+          where: { s2Cell },
+          update: { district },
+          create: { s2Cell, district },
+        })
+        .catch(() => {});
+    } else {
+      const known = await prisma.cellDistrict.findUnique({
+        where: { s2Cell },
+      });
+      if (known) {
+        finalDistrict = known.district;
+      }
+    }
 
     const message = await prisma.message.create({
       data: {
         id: uuid(),
         userId,
         nickname,
-        district,
-        type,
+        district: finalDistrict || "Local próximo",
+        type: type || (req.file.mimetype.startsWith("video/") ? "video" : "image"),
+        text: text ? String(text).trim() : null,
         mediaUrl,
-        latitude: Number(latitude),
-        longitude: Number(longitude),
+        latitude: lat,
+        longitude: lng,
+        s2Cell,
       },
     });
 
@@ -220,11 +346,12 @@ app.post("/messages/media", upload.single("media"), async (req, res) => {
 
     res.status(201).json(message);
   } catch (error) {
-    console.log(error);
+    console.error("Erro ao salvar mídia:", error);
     res.status(500).json({ error: "Erro ao salvar mídia" });
   }
 });
 
-server.listen(3333, () => {
-  console.log("AroundMe API rodando na porta 3333");
+const PORT = process.env.PORT || 3333;
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`AroundMe API com Google S2 rodando na porta ${PORT} em 0.0.0.0`);
 });

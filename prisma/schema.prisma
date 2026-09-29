@@ -28,9 +28,19 @@ model Message {
 
   latitude  Float
   longitude Float
+  s2Cell    String?
 
   createdAt DateTime @default(now())
   deletedAt DateTime?
 
   user User @relation(fields: [userId], references: [id])
+
+  @@index([s2Cell])
+}
+
+model CellDistrict {
+  s2Cell    String   @id
+  district  String
+  city      String?
+  updatedAt DateTime @updatedAt
 }
