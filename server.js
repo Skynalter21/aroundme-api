@@ -264,11 +264,23 @@ app.get("/", (req, res) => {
   });
 });
 
+// Garante que as colunas de avatar existem no SQLite
+async function ensureAvatarColumns() {
+  try {
+    await prisma.$executeRawUnsafe("ALTER TABLE User ADD COLUMN avatarUrl TEXT;");
+  } catch (e) {}
+  try {
+    await prisma.$executeRawUnsafe("ALTER TABLE RoomMessage ADD COLUMN avatarUrl TEXT;");
+  } catch (e) {}
+}
+ensureAvatarColumns();
+
 app.post("/users", async (req, res) => {
   try {
-    const { id, nickname, pushToken, latitude, longitude } = req.body;
+    const { id, nickname, avatarUrl, pushToken, latitude, longitude } = req.body;
 
     const dataToUpdate = { nickname };
+    if (avatarUrl !== undefined) dataToUpdate.avatarUrl = avatarUrl;
     if (pushToken) dataToUpdate.pushToken = pushToken;
     if (typeof latitude === "number") dataToUpdate.latitude = latitude;
     if (typeof longitude === "number") dataToUpdate.longitude = longitude;
@@ -279,6 +291,7 @@ app.post("/users", async (req, res) => {
       create: {
         id,
         nickname: nickname || "Anônimo",
+        avatarUrl: avatarUrl || null,
         pushToken: pushToken || null,
         latitude: typeof latitude === "number" ? latitude : null,
         longitude: typeof longitude === "number" ? longitude : null,
@@ -289,6 +302,44 @@ app.post("/users", async (req, res) => {
   } catch (error) {
     console.error("Erro ao salvar usuário:", error);
     res.status(500).json({ error: "Erro ao salvar usuário" });
+  }
+});
+
+// Upload de foto de perfil do usuário
+app.post("/users/:id/avatar", upload.single("avatar"), async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!req.file) {
+      return res.status(400).json({ error: "Nenhum arquivo de imagem enviado" });
+    }
+
+    const avatarUrl = `/uploads/${req.file.filename}`;
+
+    const user = await prisma.user.upsert({
+      where: { id },
+      update: { avatarUrl },
+      create: { id, nickname: "Anônimo", avatarUrl },
+    });
+
+    res.json({ success: true, avatarUrl, user });
+  } catch (error) {
+    console.error("Erro ao atualizar foto de perfil:", error);
+    res.status(500).json({ error: "Erro ao atualizar foto de perfil" });
+  }
+});
+
+// Remover foto de perfil
+app.delete("/users/:id/avatar", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const user = await prisma.user.update({
+      where: { id },
+      data: { avatarUrl: null },
+    });
+    res.json({ success: true, avatarUrl: null, user });
+  } catch (error) {
+    console.error("Erro ao remover foto de perfil:", error);
+    res.status(500).json({ error: "Erro ao remover foto de perfil" });
   }
 });
 
@@ -329,6 +380,11 @@ app.get("/messages", async (req, res) => {
 
     const candidateMessages = await prisma.message.findMany({
       where: whereCondition,
+      include: {
+        user: {
+          select: { id: true, nickname: true, avatarUrl: true },
+        },
+      },
       orderBy: { createdAt: "asc" },
     });
 
@@ -343,6 +399,7 @@ app.get("/messages", async (req, res) => {
 
         return {
           ...message,
+          avatarUrl: message.user?.avatarUrl || null,
           distance: Number(distance.toFixed(1)),
         };
       })
@@ -683,11 +740,7 @@ app.post("/rooms/:id/join", async (req, res) => {
       return res.status(404).json({ error: "Sala não encontrada" });
     }
 
-    if (room.password) {
-      if (!password || String(password).trim() !== String(room.password).trim()) {
-        return res.status(401).json({ error: "Senha incorreta para esta sala." });
-      }
-    }
+    const isOwner = room.ownerId === userId;
 
     const existingMember = await prisma.roomMember.findUnique({
       where: {
@@ -695,7 +748,14 @@ app.post("/rooms/:id/join", async (req, res) => {
       },
     });
 
-    if (!existingMember && room._count.members >= room.maxMembers) {
+    // Dono da sala e membros já existentes não precisam digitar senha novamente
+    if (room.password && !isOwner && !existingMember) {
+      if (!password || String(password).trim() !== String(room.password).trim()) {
+        return res.status(401).json({ error: "Senha incorreta para esta sala." });
+      }
+    }
+
+    if (!existingMember && !isOwner && room._count.members >= room.maxMembers) {
       return res.status(400).json({ error: "Esta sala já atingiu a capacidade máxima." });
     }
 
@@ -879,12 +939,18 @@ app.post("/rooms/:id/messages", async (req, res) => {
       return res.status(403).json({ error: "Você não faz parte desta sala ou foi removido." });
     }
 
+    const authorUser = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { avatarUrl: true },
+    });
+
     const message = await prisma.roomMessage.create({
       data: {
         id: uuid(),
         roomId: id,
         userId,
         nickname,
+        avatarUrl: authorUser?.avatarUrl || null,
         district: district || null,
         type: "text",
         text: text.trim(),

@@ -10,6 +10,7 @@ datasource db {
 model User {
   id        String   @id
   nickname  String
+  avatarUrl String?
   pushToken String?
   latitude  Float?
   longitude Float?
@@ -96,6 +97,7 @@ model RoomMessage {
   type      String    @default("text")
   text      String?
   mediaUrl  String?
+  avatarUrl String?
   createdAt DateTime  @default(now())
   deletedAt DateTime?
 
