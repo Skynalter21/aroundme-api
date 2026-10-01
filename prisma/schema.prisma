@@ -10,9 +10,14 @@ datasource db {
 model User {
   id        String   @id
   nickname  String
+  pushToken String?
+  latitude  Float?
+  longitude Float?
   createdAt DateTime @default(now())
 
-  messages Message[]
+  messages     Message[]
+  createdRooms Room[]        @relation("RoomOwner")
+  roomMembers  RoomMember[]
 }
 
 model Message {
@@ -30,7 +35,7 @@ model Message {
   longitude Float
   s2Cell    String?
 
-  createdAt DateTime @default(now())
+  createdAt DateTime  @default(now())
   deletedAt DateTime?
 
   user User @relation(fields: [userId], references: [id])
@@ -43,4 +48,58 @@ model CellDistrict {
   district  String
   city      String?
   updatedAt DateTime @updatedAt
+}
+
+model Room {
+  id          String   @id
+  name        String
+  description String?
+  category    String   @default("Geral")
+  password    String?
+  maxMembers  Int      @default(50)
+  ownerId     String
+  
+  latitude    Float
+  longitude   Float
+  district    String?
+  s2Cell      String?
+  
+  createdAt   DateTime  @default(now())
+  deletedAt   DateTime?
+
+  owner       User          @relation("RoomOwner", fields: [ownerId], references: [id])
+  members     RoomMember[]
+  messages    RoomMessage[]
+
+  @@index([s2Cell])
+}
+
+model RoomMember {
+  id       String   @id
+  roomId   String
+  userId   String
+  role     String   @default("member")
+  joinedAt DateTime @default(now())
+
+  room Room @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([roomId, userId])
+}
+
+model RoomMessage {
+  id        String    @id
+  roomId    String
+  userId    String
+  nickname  String
+  district  String?
+  type      String    @default("text")
+  text      String?
+  mediaUrl  String?
+  createdAt DateTime  @default(now())
+  deletedAt DateTime?
+
+  room Room @relation(fields: [roomId], references: [id], onDelete: Cascade)
+
+  @@index([roomId])
 }
